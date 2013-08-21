@@ -57,7 +57,7 @@ static const NSUInteger kFramesToOverlap = 15;
     CVDisplayLinkCreateWithActiveCGDisplays(&mDisplayLink);
     CVDisplayLinkSetOutputCallback(mDisplayLink, &MyDisplayLinkCallback, (__bridge void*)self);
     
-    [self startPlaying];
+    [self readNextFile];
 }
 
 - (void)dealloc
@@ -72,61 +72,49 @@ static const NSUInteger kFramesToOverlap = 15;
     }
 }
 
-- (void)startPlaying
+- (void)readNextFile
 {
-    NSURL* url = [self nextFileToRead];
-    if (url)
-    {
-        [self readFile: url];
-    }
-}
-
-- (NSURL*)nextFileToRead
-{
-    NSURL* url = [[NSBundle mainBundle] URLForResource: [NSString stringWithFormat: @"File%lu", mFileIndex++] withExtension: @"txt"];
-    return url;
-}
-
-- (void)readFile: (NSURL*)url
-{
-    if (mReadingChannel)
-    {
-        dispatch_io_close(mReadingChannel, DISPATCH_IO_STOP);
-        mReadingChannel = nil;
-    }
-    
-    // We don't care what queue the cleanup handler gets called on, because we know there's only ever one file being read at a time
-    mReadingChannel = dispatch_io_create_with_path(DISPATCH_IO_STREAM, [[url path] fileSystemRepresentation], O_RDONLY|O_NONBLOCK, 0, mFrameReadQueue, ^(int error) {
-        DieOnError(error);
+    dispatch_async (mFrameReadQueue, ^{
+        NSURL* url = [[NSBundle mainBundle] URLForResource: [NSString stringWithFormat: @"File%lu", mFileIndex++] withExtension: @"txt"];
         
-        mReadingChannel = nil;
+        if (!url)
+            return;
         
-        // Start the next file
-        NSURL* url = [self nextFileToRead];
-        if (url)
-        {
-            [self readFile: url];
-        }
-    });
-    
-    // We don't care what queue the read handlers get called on, because we know they're inherently serial
-    dispatch_io_read(mReadingChannel, 0, SIZE_MAX, mFrameReadQueue, ^(bool done, dispatch_data_t data, int error) {
-        DieOnError(error);
-        
-        // Grab frames
-        dispatch_data_t localAccumulator = mFrameReadAccumulator ? dispatch_data_create_concat(mFrameReadAccumulator, data) : data;
-        dispatch_data_t frameData = nil;
-        do
-        {
-            frameData = FrameDataFromAccumulator(&localAccumulator);
-            mFrameReadAccumulator = localAccumulator;
-            [self processFrameData: frameData fromFile: url];
-        } while (frameData);
-        
-        if (done)
+        if (mReadingChannel)
         {
             dispatch_io_close(mReadingChannel, DISPATCH_IO_STOP);
+            mReadingChannel = nil;
         }
+        
+        // We don't care what queue the cleanup handler gets called on, because we know there's only ever one file being read at a time
+        mReadingChannel = dispatch_io_create_with_path(DISPATCH_IO_STREAM, [[url path] fileSystemRepresentation], O_RDONLY|O_NONBLOCK, 0, mFrameReadQueue, ^(int error) {
+            DieOnError(error);
+            
+            mReadingChannel = nil;
+            
+            // Start the next file
+            [self readNextFile];
+        });
+        
+        // We don't care what queue the read handlers get called on, because we know they're inherently serial
+        dispatch_io_read(mReadingChannel, 0, SIZE_MAX, mFrameReadQueue, ^(bool done, dispatch_data_t data, int error) {
+            DieOnError(error);
+            
+            // Grab frames
+            dispatch_data_t localAccumulator = mFrameReadAccumulator ? dispatch_data_create_concat(mFrameReadAccumulator, data) : data;
+            dispatch_data_t frameData = nil;
+            do
+            {
+                frameData = FrameDataFromAccumulator(&localAccumulator);
+                mFrameReadAccumulator = localAccumulator;
+                [self processFrameData: frameData fromFile: url];
+            } while (frameData);
+            
+            if (done)
+            {
+                dispatch_io_close(mReadingChannel, DISPATCH_IO_STOP);
+            }
+        });
     });
 }
 
@@ -201,7 +189,6 @@ static const NSUInteger kFramesToOverlap = 15;
         dispatch_sync(mFrameDeliveryStateQueue, ^{
             mLastFrameDelivered++;
             mDeliveredFrame = frame;
-            
         });
         
         if (!CVDisplayLinkIsRunning(mDisplayLink))
@@ -214,7 +201,6 @@ static const NSUInteger kFramesToOverlap = 15;
 - (dispatch_data_t)getFrameForDisplay
 {
     __block dispatch_data_t frameData = nil;
-
     dispatch_sync(mFrameDeliveryStateQueue, ^{
         if (mLastFrameDelivered > mLastFrameDisplayed)
         {
@@ -232,26 +218,6 @@ static const NSUInteger kFramesToOverlap = 15;
     }
 
     return frameData;
-}
-
-static CVReturn MyDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeStamp* now, const CVTimeStamp* outputTime, CVOptionFlags flagsIn, CVOptionFlags* flagsOut, void* displayLinkContext)
-{
-    SOAppDelegate* self = (__bridge SOAppDelegate*)displayLinkContext;
-    
-    dispatch_data_t frameData = [self getFrameForDisplay];
-    
-    NSString* dataAsString = NSStringFromDispatchData(frameData);
-    
-    if (dataAsString.length == 0)
-    {
-        NSLog(@"Dropped frame...");
-    }
-    else
-    {
-        NSLog(@"Drawing frame in CVDisplayLink. Contents: %@", dataAsString);
-    }
-
-    return kCVReturnSuccess;
 }
 
 @end
@@ -321,3 +287,24 @@ static dispatch_data_t FrameDataFromAccumulator(dispatch_data_t* accumulator)
     
     return didFindFrame ? frameData : nil;
 }
+
+static CVReturn MyDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeStamp* now, const CVTimeStamp* outputTime, CVOptionFlags flagsIn, CVOptionFlags* flagsOut, void* displayLinkContext)
+{
+    SOAppDelegate* self = (__bridge SOAppDelegate*)displayLinkContext;
+    
+    dispatch_data_t frameData = [self getFrameForDisplay];
+    
+    NSString* dataAsString = NSStringFromDispatchData(frameData);
+    
+    if (dataAsString.length == 0)
+    {
+        NSLog(@"Dropped frame...");
+    }
+    else
+    {
+        NSLog(@"Drawing frame in CVDisplayLink. Contents: %@", dataAsString);
+    }
+    
+    return kCVReturnSuccess;
+}
+
