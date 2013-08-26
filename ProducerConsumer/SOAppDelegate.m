@@ -7,6 +7,8 @@
 //
 
 #import "SOAppDelegate.h"
+#import <libkern/OSAtomic.h>
+#import <objc/runtime.h>
 
 static void DieOnError(int error);
 static NSString* NSStringFromDispatchData(dispatch_data_t data);
@@ -14,6 +16,8 @@ static dispatch_data_t FrameDataFromAccumulator(dispatch_data_t* accumulator);
 static CVReturn MyDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeStamp* now, const CVTimeStamp* outputTime, CVOptionFlags flagsIn, CVOptionFlags* flagsOut, void* displayLinkContext);
 
 static const NSUInteger kFramesToOverlap = 15;
+
+static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatch_block_t completionBlock, dispatch_queue_t completionQueue);
 
 @implementation SOAppDelegate
 {
@@ -107,7 +111,12 @@ static const NSUInteger kFramesToOverlap = 15;
             {
                 frameData = FrameDataFromAccumulator(&localAccumulator);
                 mFrameReadAccumulator = localAccumulator;
-                [self processFrameData: frameData fromFile: url];
+                // mimic 12ms of reading time
+                double delayInSeconds = 0.012;
+                dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
+                dispatch_after(popTime, dispatch_get_global_queue(0, 0), ^(void){
+                    [self decodeFrameData: frameData fromFile: url];
+                });
             } while (frameData);
             
             if (done)
@@ -116,6 +125,21 @@ static const NSUInteger kFramesToOverlap = 15;
             }
         });
     });
+}
+
+
+- (void)decodeFrameData: (dispatch_data_t)frameData fromFile: (NSURL*)file
+{
+    __block dispatch_data_t decodedData = nil;
+    EnqueueOrderedParallelizableWork(^{
+        // Do the work - 13ms +/- 2.5ms
+        int random = (rand() % 5000) - 2500 + 13000;
+        usleep(random);
+        NSString* decodedFrame = [NSStringFromDispatchData(frameData) uppercaseString];
+        decodedData = dispatch_data_create(decodedFrame.UTF8String, decodedFrame.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    }, ^{
+        [self processFrameData:decodedData fromFile:file];
+    }, mFrameDataProcessingQueue);
 }
 
 - (void)processFrameData: (dispatch_data_t)frameData fromFile: (NSURL*)file
@@ -307,4 +331,73 @@ static CVReturn MyDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTime
     
     return kCVReturnSuccess;
 }
+
+
+static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatch_block_t completionBlock, dispatch_queue_t completionQueue)
+{
+    // Protect our pending items state
+    static dispatch_queue_t sSerialQueue;
+    static NSMutableArray* sPendingItems;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        sSerialQueue = dispatch_queue_create("", DISPATCH_QUEUE_SERIAL);
+        sPendingItems = [[NSMutableArray alloc] init];
+    });
+    
+    // I'm too lazy to make a full subclass for this stuff -- associated sotrage to the rescue!
+    static void * const WorkItemCompletionBlockKey = (void*)&WorkItemCompletionBlockKey;
+    static void * const WorkItemCompletionQueueKey = (void*)&WorkItemCompletionQueueKey;
+    static void * const WorkItemTaskCompleteKey = (void*)&WorkItemTaskCompleteKey;
+
+    // Build the work item
+    NSObject* workItem = [[NSObject alloc] init];
+    objc_setAssociatedObject(workItem, WorkItemCompletionBlockKey, completionBlock, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(workItem, WorkItemCompletionQueueKey, completionQueue, OBJC_ASSOCIATION_RETAIN);
+    
+    // Dispatch it.
+    dispatch_async(sSerialQueue, ^{
+        // Add it to the list
+        [sPendingItems insertObject: workItem atIndex: 0];
+
+        // Use a group to get a callback
+        dispatch_group_t group = dispatch_group_create();
+        
+        // Now kick off the real work
+        dispatch_group_async(group, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), workBlock);
+        
+        // Call us back when that work completes
+        dispatch_group_notify(group, sSerialQueue, ^{
+            // Mark it finished...
+            objc_setAssociatedObject(workItem, WorkItemTaskCompleteKey, (id)@(YES), OBJC_ASSOCIATION_ASSIGN);
+            
+            // Fire completions for any completed tasks at the end of the queue.
+            for (NSObject* completedWorkItem = sPendingItems.lastObject; objc_getAssociatedObject(completedWorkItem, WorkItemTaskCompleteKey); [sPendingItems removeLastObject], completedWorkItem = sPendingItems.lastObject)
+            {
+                dispatch_queue_t innerCompletionQueue = objc_getAssociatedObject(completedWorkItem, WorkItemCompletionQueueKey);
+                dispatch_block_t innerCompletionBlock = objc_getAssociatedObject(completedWorkItem, WorkItemCompletionBlockKey);
+                dispatch_async(innerCompletionQueue, innerCompletionBlock);
+            }
+        });
+    });
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
