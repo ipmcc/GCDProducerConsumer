@@ -16,6 +16,7 @@ static dispatch_data_t FrameDataFromAccumulator(dispatch_data_t* accumulator);
 static CVReturn MyDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeStamp* now, const CVTimeStamp* outputTime, CVOptionFlags flagsIn, CVOptionFlags* flagsOut, void* displayLinkContext);
 
 static const NSUInteger kFramesToOverlap = 15;
+static const NSUInteger kMaxFramesInPipelineAtOnce = kFramesToOverlap * 3;
 
 static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatch_block_t completionBlock, dispatch_queue_t completionQueue);
 
@@ -27,7 +28,6 @@ static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatc
     // State for our file reading process -- protected via mFrameReadQueue
     dispatch_queue_t mFrameReadQueue;
     NSUInteger mFileIndex; // keep track of what file we're reading
-    dispatch_io_t mReadingChannel; // channel for reading
     dispatch_data_t mFrameReadAccumulator; // keep track of left-over data across read operations
 
     // State for processing raw frame data delivered by the read process - protected via mFrameDataProcessingQueue
@@ -44,6 +44,9 @@ static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatc
     dispatch_data_t mDeliveredFrame; // Data of the frame that has been delivered, but not yet picked up by the CVDisplayLink
     NSInteger mLastFrameDelivered; // Counter of frames delivered
     NSInteger mLastFrameDisplayed; // Counter of frames displayed
+
+    volatile int32_t mNumFramesInBuffer;
+    dispatch_queue_t mLogQueue;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification
@@ -57,6 +60,7 @@ static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatc
     mFrameBlendingQueue = dispatch_queue_create("mFrameBlendingQueue", DISPATCH_QUEUE_SERIAL);
     mFrameDeliveryQueue = dispatch_queue_create("mFrameDeliveryQueue", DISPATCH_QUEUE_SERIAL);
     mFrameDeliveryStateQueue = dispatch_queue_create("mFrameDeliveryStateQueue", DISPATCH_QUEUE_SERIAL);
+    mLogQueue = dispatch_queue_create("mLogQueue", DISPATCH_QUEUE_SERIAL);
     
     CVDisplayLinkCreateWithActiveCGDisplays(&mDisplayLink);
     CVDisplayLinkSetOutputCallback(mDisplayLink, &MyDisplayLinkCallback, (__bridge void*)self);
@@ -76,52 +80,94 @@ static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatc
     }
 }
 
+- (void)didAddFrame
+{
+    const int64_t framesIn = OSAtomicIncrement32(&self->mNumFramesInBuffer);
+    const char* func = __PRETTY_FUNCTION__;
+    dispatch_async(mLogQueue, ^{  NSLog(@"%s frameCount: %@", func, @(framesIn)); });
+    if (framesIn == kMaxFramesInPipelineAtOnce) // we've transitioned to "at the limit"
+    {
+        dispatch_suspend(mFrameReadQueue);
+    }
+}
+
+- (void)didRemoveFrame
+{
+    const int64_t framesIn = OSAtomicDecrement32(&self->mNumFramesInBuffer);
+    const char* func = __PRETTY_FUNCTION__;
+    dispatch_async(mLogQueue, ^{  NSLog(@"%s frameCount: %@", func, @(framesIn)); });
+    if (framesIn == kMaxFramesInPipelineAtOnce - 1) // we transitioned to "under the limit"
+    {
+        dispatch_resume(mFrameReadQueue);
+    }
+}
+
 - (void)readNextFile
 {
     dispatch_async (mFrameReadQueue, ^{
         NSURL* url = [[NSBundle mainBundle] URLForResource: [NSString stringWithFormat: @"File%lu", mFileIndex++] withExtension: @"txt"];
         
         if (!url)
-            return;
-        
-        if (mReadingChannel)
         {
-            dispatch_io_close(mReadingChannel, DISPATCH_IO_STOP);
-            mReadingChannel = nil;
+            // Run out the buffer with dummy frames;
+            dispatch_data_t empty = dispatch_data_create(NULL, 0, NULL, NULL);
+            for (NSUInteger i = 0; i < kFramesToOverlap; i++)
+            {
+                // we have to dispatch, and then dispatch_after here to preserve the order, otherwise the fake frames could jump the line...
+                dispatch_async(mFrameReadQueue, ^{
+                    double delayInSeconds = 0.012;
+                    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
+                    dispatch_after(popTime, mFrameReadQueue, ^(void){
+                        [self didAddFrame];
+                        [self decodeFrameData: empty fromFile: (id)[NSNull null]];
+                    });
+                });
+            }
+            
+            return;
         }
         
         // We don't care what queue the cleanup handler gets called on, because we know there's only ever one file being read at a time
-        mReadingChannel = dispatch_io_create_with_path(DISPATCH_IO_STREAM, [[url path] fileSystemRepresentation], O_RDONLY|O_NONBLOCK, 0, mFrameReadQueue, ^(int error) {
+        dispatch_io_t readChannel = dispatch_io_create_with_path(DISPATCH_IO_STREAM, [[url path] fileSystemRepresentation], O_RDONLY|O_NONBLOCK, 0, mFrameReadQueue, ^(int error) {
             DieOnError(error);
             
-            mReadingChannel = nil;
+            mFrameReadAccumulator = nil;
             
             // Start the next file
             [self readNextFile];
         });
         
         // We don't care what queue the read handlers get called on, because we know they're inherently serial
-        dispatch_io_read(mReadingChannel, 0, SIZE_MAX, mFrameReadQueue, ^(bool done, dispatch_data_t data, int error) {
+        dispatch_io_read(readChannel, 0, SIZE_MAX, mFrameReadQueue, ^(bool done, dispatch_data_t data, int error) {
             DieOnError(error);
             
             // Grab frames
             dispatch_data_t localAccumulator = mFrameReadAccumulator ? dispatch_data_create_concat(mFrameReadAccumulator, data) : data;
+            if (done)
+            {
+                // In case the trailing newline is missing...
+                localAccumulator = dispatch_data_create_concat(localAccumulator, dispatch_data_create("\n", 1, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT));
+            }
             dispatch_data_t frameData = nil;
             do
             {
                 frameData = FrameDataFromAccumulator(&localAccumulator);
                 mFrameReadAccumulator = localAccumulator;
                 // mimic 12ms of reading time
-                double delayInSeconds = 0.012;
-                dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
-                dispatch_after(popTime, dispatch_get_global_queue(0, 0), ^(void){
-                    [self decodeFrameData: frameData fromFile: url];
-                });
+                if (frameData && dispatch_data_get_size(frameData) > 1)
+                {
+                    double delayInSeconds = 0.012;
+                    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
+                    dispatch_after(popTime, mFrameReadQueue, ^(void){
+                        [self didAddFrame];
+                        [self decodeFrameData: frameData fromFile: url];
+                    });
+                }
             } while (frameData);
             
             if (done)
             {
-                dispatch_io_close(mReadingChannel, DISPATCH_IO_STOP);
+                dispatch_io_close(readChannel, DISPATCH_IO_STOP);
             }
         });
     });
@@ -200,6 +246,10 @@ static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatc
         NSString* blendedFrame = [NSString stringWithFormat: @"%@%@", [NSStringFromDispatchData(frameA) stringByReplacingOccurrencesOfString: @"\n" withString:@""], NSStringFromDispatchData(frameB)];
         dispatch_data_t blendedFrameData = dispatch_data_create(blendedFrame.UTF8String, blendedFrame.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
         [self deliverFrameForDisplay: blendedFrameData];
+        if (frameA && frameB)
+        {
+            [self didRemoveFrame]; // 2 frames becomes 1, that's removing a frame
+        }
     });
 }
 
@@ -231,6 +281,7 @@ static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatc
             frameData = mDeliveredFrame;
             mDeliveredFrame = nil;
             mLastFrameDisplayed = mLastFrameDelivered;
+            [self didRemoveFrame];
         }
     });
 
@@ -242,6 +293,26 @@ static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatc
     }
 
     return frameData;
+}
+
+static CVReturn MyDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeStamp* now, const CVTimeStamp* outputTime, CVOptionFlags flagsIn, CVOptionFlags* flagsOut, void* displayLinkContext)
+{
+    SOAppDelegate* self = (__bridge SOAppDelegate*)displayLinkContext;
+    
+    dispatch_data_t frameData = [self getFrameForDisplay];
+    
+    NSString* dataAsString = NSStringFromDispatchData(frameData);
+    
+    if (dataAsString.length == 0)
+    {
+        dispatch_async(self->mLogQueue, ^{ NSLog(@"Dropped frame..."); });
+    }
+    else
+    {
+        dispatch_async(self->mLogQueue, ^{  NSLog(@"Drawing frame in CVDisplayLink. Contents: %@", dataAsString); });
+    }
+    
+    return kCVReturnSuccess;
 }
 
 @end
@@ -290,48 +361,35 @@ static dispatch_data_t FrameDataFromAccumulator(dispatch_data_t* accumulator)
         {
             if (!didFindFrame)
             {
-                frameData = dispatch_data_create_concat(frameData, region);
+                frameData = dispatch_data_create_concat(frameData, dispatch_data_create(buffer, size, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT));
             }
             else
             {
-                leftOver = dispatch_data_create_concat(leftOver, region);
+                leftOver = dispatch_data_create_concat(leftOver, dispatch_data_create(buffer, size, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT));
             }
         }
         else if (newline >= 0)
         {
             didFindFrame = YES;
-            frameData = dispatch_data_create_concat(frameData, dispatch_data_create_subrange(region, 0, newline + 1));
-            leftOver = dispatch_data_create_concat(leftOver, dispatch_data_create_subrange(region, newline + 1, size - newline - 1));
+            frameData = dispatch_data_create_concat(frameData, dispatch_data_create(buffer, newline + 1, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT));// ideally I'd do dispatch_data_create_subrange(region, 0, newline + 1)); here but I've noticed some issues with that.
+            leftOver = dispatch_data_create_concat(leftOver, dispatch_data_create(((uint8_t*)buffer) + newline + 1, size - newline - 1, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT));
+            return false;
         }
         
         return true;
     });
     
+    if (!didFindFrame)
+    {
+        leftOver = dispatch_data_create_concat(frameData, leftOver);
+    }
+    
+    frameData = didFindFrame && dispatch_data_get_size(frameData) > 1 ? frameData : nil;
+    
     *accumulator = leftOver;
     
-    return didFindFrame ? frameData : nil;
+    return frameData;
 }
-
-static CVReturn MyDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeStamp* now, const CVTimeStamp* outputTime, CVOptionFlags flagsIn, CVOptionFlags* flagsOut, void* displayLinkContext)
-{
-    SOAppDelegate* self = (__bridge SOAppDelegate*)displayLinkContext;
-    
-    dispatch_data_t frameData = [self getFrameForDisplay];
-    
-    NSString* dataAsString = NSStringFromDispatchData(frameData);
-    
-    if (dataAsString.length == 0)
-    {
-        NSLog(@"Dropped frame...");
-    }
-    else
-    {
-        NSLog(@"Drawing frame in CVDisplayLink. Contents: %@", dataAsString);
-    }
-    
-    return kCVReturnSuccess;
-}
-
 
 static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatch_block_t completionBlock, dispatch_queue_t completionQueue)
 {
