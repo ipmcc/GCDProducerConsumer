@@ -20,6 +20,8 @@ static const NSUInteger kMaxFramesInPipelineAtOnce = kFramesToOverlap * 3;
 
 static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatch_block_t completionBlock, dispatch_queue_t completionQueue);
 
+static void SpinFor(int64_t nanosec);
+
 @implementation SOAppDelegate
 {
     // Display link state
@@ -83,8 +85,8 @@ static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatc
 - (void)didAddFrame
 {
     const int64_t framesIn = OSAtomicIncrement32(&self->mNumFramesInBuffer);
-    const char* func = __PRETTY_FUNCTION__;
-    dispatch_async(mLogQueue, ^{  NSLog(@"%s frameCount: %@", func, @(framesIn)); });
+    //const char* func = __PRETTY_FUNCTION__;
+    //dispatch_async(mLogQueue, ^{  NSLog(@"%s frameCount: %@", func, @(framesIn)); });
     if (framesIn == kMaxFramesInPipelineAtOnce) // we've transitioned to "at the limit"
     {
         dispatch_suspend(mFrameReadQueue);
@@ -94,8 +96,8 @@ static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatc
 - (void)didRemoveFrame
 {
     const int64_t framesIn = OSAtomicDecrement32(&self->mNumFramesInBuffer);
-    const char* func = __PRETTY_FUNCTION__;
-    dispatch_async(mLogQueue, ^{  NSLog(@"%s frameCount: %@", func, @(framesIn)); });
+    //const char* func = __PRETTY_FUNCTION__;
+    //dispatch_async(mLogQueue, ^{  NSLog(@"%s frameCount: %@", func, @(framesIn)); });
     if (framesIn == kMaxFramesInPipelineAtOnce - 1) // we transitioned to "under the limit"
     {
         dispatch_resume(mFrameReadQueue);
@@ -113,15 +115,8 @@ static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatc
             dispatch_data_t empty = dispatch_data_create(NULL, 0, NULL, NULL);
             for (NSUInteger i = 0; i < kFramesToOverlap; i++)
             {
-                // we have to dispatch, and then dispatch_after here to preserve the order, otherwise the fake frames could jump the line...
-                dispatch_async(mFrameReadQueue, ^{
-                    double delayInSeconds = 0.012;
-                    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
-                    dispatch_after(popTime, mFrameReadQueue, ^(void){
-                        [self didAddFrame];
-                        [self decodeFrameData: empty fromFile: (id)[NSNull null]];
-                    });
-                });
+                [self didAddFrame];
+                [self decodeFrameData: empty fromFile: (id)[NSNull null]];
             }
             
             return;
@@ -153,15 +148,13 @@ static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatc
             {
                 frameData = FrameDataFromAccumulator(&localAccumulator);
                 mFrameReadAccumulator = localAccumulator;
-                // mimic 12ms of reading time
                 if (frameData && dispatch_data_get_size(frameData) > 1)
                 {
-                    double delayInSeconds = 0.012;
-                    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
-                    dispatch_after(popTime, mFrameReadQueue, ^(void){
-                        [self didAddFrame];
-                        [self decodeFrameData: frameData fromFile: url];
-                    });
+                    SpinFor(12 * NSEC_PER_MSEC); // Simulate the 12ms to read the frame
+                    // This isn't exactly realistic since a real "read delay" would not block the thread servicing mFrameReadQueue
+                    // But it's probably good enough.
+                    [self didAddFrame];
+                    [self decodeFrameData: frameData fromFile: url];
                 }
             } while (frameData);
             
@@ -180,7 +173,7 @@ static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatc
     EnqueueOrderedParallelizableWork(^{
         // Do the work - 13ms +/- 2.5ms
         int random = (rand() % 5000) - 2500 + 13000;
-        usleep(random);
+        SpinFor(random * NSEC_PER_USEC);
         NSString* decodedFrame = [NSStringFromDispatchData(frameData) uppercaseString];
         decodedData = dispatch_data_create(decodedFrame.UTF8String, decodedFrame.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
     }, ^{
@@ -312,6 +305,8 @@ static CVReturn MyDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTime
         dispatch_async(self->mLogQueue, ^{  NSLog(@"Drawing frame in CVDisplayLink. Contents: %@", dataAsString); });
     }
     
+    SpinFor(15 * NSEC_PER_MSEC);
+    
     return kCVReturnSuccess;
 }
 
@@ -440,6 +435,17 @@ static void EnqueueOrderedParallelizableWork(dispatch_block_t workBlock, dispatc
 }
 
 
+static void SpinFor(int64_t nanoSeconds)
+{
+    OSSpinLock lock = OS_SPINLOCK_INIT;
+    volatile OSSpinLock* const lockPtr = &lock;
+    OSSpinLockLock(lockPtr); // Lock it
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, nanoSeconds), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(void){
+        OSSpinLockUnlock(lockPtr); // unlock after milliSeconds
+    });
+    OSSpinLockLock(lockPtr); // Block waiting
+    OSSpinLockUnlock(lockPtr); // Probably irrelevant, but...
+}
 
 
 
